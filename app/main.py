@@ -1,4 +1,5 @@
-"""FastAPI 入口：上传参考 FASTA + 两份单样本 VCF，展示归一化核对结果。"""
+"""FastAPI 入口：上传参考 FASTA + 两份单样本 VCF，展示归一化核对结果；
+并提供 SAM 读段证据核查入口，验证单样本 VCF 的 GT 是否有原始双端读段支持。"""
 
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from .bio import (
     parse_fasta,
     parse_vcf,
 )
+from .evidence import MAX_SAM_BYTES, check_evidence
 
 app = FastAPI(
     title="双 VCF 变异核对",
@@ -27,8 +29,7 @@ def _read_limited(file: UploadFile, limit: int, label: str) -> bytes:
     data = file.file.read(limit + 1)
     if len(data) > limit:
         raise CheckError(
-            f"{label} 超过大小上限 {limit} 字节"
-            f"（FASTA 上限 {MAX_FASTA_BYTES // 1024} KiB，VCF 上限 {MAX_VCF_BYTES // 1024} KiB）。"
+            f"{label} 超过大小上限 {limit} 字节（{limit // 1024} KiB）。"
         )
     if not data:
         raise CheckError(f"{label} 为空文件。")
@@ -51,6 +52,7 @@ def index(request: Request):
         {
             "fasta_limit_kib": MAX_FASTA_BYTES // 1024,
             "vcf_limit_kib": MAX_VCF_BYTES // 1024,
+            "sam_limit_kib": MAX_SAM_BYTES // 1024,
         },
     )
 
@@ -140,4 +142,95 @@ def compare_api(
         "reference": {"name": refobj.name, "length": len(refobj.sequence)},
         "samples": {"left": sample_a, "right": sample_b},
         "result": {key: [dump_entry(e) for e in rows] for key, rows in groups.items()},
+    }
+
+
+# --------------------------------------------------------------------------- #
+# SAM 读段证据核查
+# --------------------------------------------------------------------------- #
+def _evidence_context(**extra):
+    ctx = {
+        "fasta_limit_kib": MAX_FASTA_BYTES // 1024,
+        "vcf_limit_kib": MAX_VCF_BYTES // 1024,
+        "sam_limit_kib": MAX_SAM_BYTES // 1024,
+    }
+    ctx.update(extra)
+    return ctx
+
+
+@app.get("/evidence", response_class=HTMLResponse)
+def evidence_page(request: Request):
+    return templates.TemplateResponse(
+        request, "evidence.html", _evidence_context()
+    )
+
+
+@app.post("/evidence", response_class=HTMLResponse)
+def evidence_submit(
+    request: Request,
+    fasta: UploadFile = File(...),
+    vcf: UploadFile = File(...),
+    sam: UploadFile = File(...),
+):
+    try:
+        fasta_bytes = _read_limited(fasta, MAX_FASTA_BYTES, "参考 FASTA")
+        vcf_bytes = _read_limited(vcf, MAX_VCF_BYTES, "待核查 VCF")
+        sam_bytes = _read_limited(sam, MAX_SAM_BYTES, "SAM")
+        report = check_evidence(fasta_bytes, vcf_bytes, sam_bytes)
+    except CheckError as exc:
+        # 输入错误时整次失败：只展示错误，不展示任何局部结论
+        return templates.TemplateResponse(
+            request,
+            "evidence.html",
+            _evidence_context(error=str(exc)),
+            status_code=422,
+        )
+
+    return templates.TemplateResponse(
+        request, "evidence_result.html", {"report": report}
+    )
+
+
+@app.post("/api/evidence")
+def evidence_api(
+    fasta: UploadFile = File(...),
+    vcf: UploadFile = File(...),
+    sam: UploadFile = File(...),
+):
+    """证据核查 JSON 接口；失败返回 422 与错误信息。"""
+    try:
+        fasta_bytes = _read_limited(fasta, MAX_FASTA_BYTES, "参考 FASTA")
+        vcf_bytes = _read_limited(vcf, MAX_VCF_BYTES, "待核查 VCF")
+        sam_bytes = _read_limited(sam, MAX_SAM_BYTES, "SAM")
+        report = check_evidence(fasta_bytes, vcf_bytes, sam_bytes)
+    except CheckError as exc:
+        return JSONResponse(status_code=422, content={"ok": False, "error": str(exc)})
+
+    return {
+        "ok": True,
+        "reference": {"name": report.ref_name, "length": report.ref_length},
+        "sample": report.sample_name,
+        "fragments": {
+            "total": report.fragments_total,
+            "reads_used": report.reads_used,
+            "reads_ignored": report.reads_ignored,
+        },
+        "sites": [
+            {
+                "pos": s.pos,
+                "ref": s.ref_base,
+                "alts": s.alt_bases,
+                "gt_bases": s.gt_bases,
+                "line_numbers": s.line_numbers,
+                "raw": s.raw_descriptions,
+                "fragments": s.counts,
+                "conflicts": s.conflicts,
+                "deletion_fragments": s.deletion_fragments,
+                "coverage": s.coverage,
+                "fractions": {b: round(s.fractions[b], 4) for b in s.counts},
+                "status": s.status,
+                "reasons": s.mismatch_reasons,
+            }
+            for s in report.sites
+        ],
     }

@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from app.main import app  # noqa: E402
 from app.bio import MAX_FASTA_BYTES, MAX_VCF_BYTES  # noqa: E402
+from app.evidence import MAX_SAM_BYTES  # noqa: E402
 
 client = TestClient(app)
 
@@ -142,6 +143,154 @@ class WebTests(unittest.TestCase):
                 "fasta": ("ref.fa", FASTA, "text/plain"),
                 "vcf_a": ("a.vcf", vcf(["chrT\t2\t.\tG\tT\t.\t.\t.\tGT\t0/1"]), "text/plain"),
                 "vcf_b": ("b.vcf", vcf([]), "text/plain"),
+            },
+        )
+        self.assertEqual(resp.status_code, 422)
+        self.assertFalse(resp.json()["ok"])
+
+
+# --------------------------------------------------------------------------- #
+# 读段证据核查
+# --------------------------------------------------------------------------- #
+EVIDENCE_VCF = vcf([
+    "chrT\t2\t.\tC\tG\t.\t.\t.\tGT\t0/1",
+    "chrT\t3\t.\tG\tT\t.\t.\t.\tGT\t1/1",
+])
+
+Q20 = "5"
+
+
+def sam_line(qname, flag, pos, cigar, seq, qual=None):
+    if qual is None:
+        qual = Q20 * len(seq)
+    return (
+        f"{qname}\t{flag}\tchrT\t{pos}\t60\t{cigar}\t*\t0\t0\t{seq}\t{qual}"
+    )
+
+
+def evidence_sam(lines, headers=("@HD\tVN:1.6", "@SQ\tSN:chrT\tLN:12")):
+    return ("\n".join(list(headers) + lines) + "\n").encode()
+
+
+def upload_evidence(vcf_bytes=EVIDENCE_VCF, sam_bytes=None, fasta=FASTA):
+    return client.post(
+        "/evidence",
+        files={
+            "fasta": ("ref.fa", fasta, "text/plain"),
+            "vcf": ("c.vcf", vcf_bytes, "text/plain"),
+            "sam": ("r.sam", sam_bytes if sam_bytes is not None else b"", "text/plain"),
+        },
+    )
+
+
+class EvidenceWebTests(unittest.TestCase):
+    def test_evidence_entry_renders(self):
+        resp = client.get("/evidence")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("读段证据核查".encode(), resp.content)
+        self.assertIn("256 KiB".encode(), resp.content)
+
+    def test_index_links_to_evidence(self):
+        resp = client.get("/")
+        self.assertIn(b"/evidence", resp.content)
+
+    def test_evidence_happy_path_page(self):
+        # 位点 2：8 个 C + 2 个 G（C 80%、G 20%，GT 0/1 含 C/G -> 相符）
+        # 位点 3：8 个读段给出参考 G、2 个给出 T（G 80%、T 20%，GT 0/1 -> 相符）
+        lines = []
+        for i in range(8):
+            lines.append(sam_line(f"c{i}", 0, 1, "3M", "ACG"))  # pos2=C, pos3=G
+        for i in range(2):
+            lines.append(sam_line(f"g{i}", 0, 1, "3M", "AGT"))  # pos2=G, pos3=T
+        resp = upload_evidence(
+            vcf_bytes=vcf([
+                "chrT\t2\t.\tC\tG\t.\t.\t.\tGT\t0/1",
+                "chrT\t3\t.\tG\tT\t.\t.\t.\tGT\t0/1",
+            ]),
+            sam_bytes=evidence_sam(lines),
+        )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.text
+        self.assertIn("位点证据明细", body)
+        self.assertIn("有效覆盖", body)
+        self.assertIn("原始行号", body)
+        # 两个位点都应判相符：表格状态列出现两次“相符”徽标
+        self.assertEqual(body.count('color:var(--ok)">相符'), 2)
+        self.assertIn("3:G", body)
+
+    def test_evidence_conflict_and_insufficient_shown(self):
+        # 位点 2：一个双端冲突片段 + 8 个 G 片段 -> 覆盖 8 < 10，证据不足
+        lines = [
+            sam_line("x", 0x40, 1, "2M", "AG"),
+            sam_line("x", 0x80, 2, "2M", "TA"),
+        ]
+        for i in range(8):
+            lines.append(sam_line(f"g{i}", 0, 1, "2M", "AG"))
+        resp = upload_evidence(
+            vcf_bytes=vcf(["chrT\t2\t.\tC\tG\t.\t.\t.\tGT\t0/1"]),
+            sam_bytes=evidence_sam(lines),
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("证据不足", resp.text)
+        self.assertIn(">1<", resp.text)  # 冲突数 1
+
+    def test_evidence_indel_failure_is_whole_failure(self):
+        bad_vcf = vcf(["chrT\t4\t.\tT\tTA\t.\t.\t.\tGT\t0/1"])
+        resp = upload_evidence(
+            vcf_bytes=bad_vcf,
+            sam_bytes=evidence_sam([sam_line("r", 0, 1, "4M", "ACGT")]),
+        )
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("证据核查失败", resp.text)
+        self.assertNotIn("位点证据明细", resp.text)
+
+    def test_evidence_sam_size_limit(self):
+        big_sam = b"@HD\tVN:1.6\n" + b"#\n" * (MAX_SAM_BYTES // 2)
+        resp = upload_evidence(sam_bytes=big_sam)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("超过大小上限", resp.text)
+
+    def test_evidence_empty_sam_file_rejected(self):
+        resp = upload_evidence(sam_bytes=b"")
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("为空", resp.text)
+
+    def test_evidence_bad_cigar_failure(self):
+        resp = upload_evidence(
+            sam_bytes=evidence_sam([sam_line("r", 0, 1, "3N", "ACG")])
+        )
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("CIGAR", resp.text)
+
+    def test_api_evidence_happy_path(self):
+        # GT 0/1 含 C、G：8 G + 2 C，两种 GT 碱基均 >=20%
+        lines = [sam_line(f"g{i}", 0, 1, "2M", "AG") for i in range(8)]
+        lines += [sam_line(f"c{i}", 0, 1, "2M", "AC") for i in range(2)]
+        resp = client.post(
+            "/api/evidence",
+            files={
+                "fasta": ("ref.fa", FASTA, "text/plain"),
+                "vcf": ("c.vcf", vcf(["chrT\t2\t.\tC\tG\t.\t.\t.\tGT\t0/1"]), "text/plain"),
+                "sam": ("r.sam", evidence_sam(lines), "text/plain"),
+            },
+        )
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertTrue(data["ok"])
+        site = data["sites"][0]
+        self.assertEqual(site["pos"], 2)
+        self.assertEqual(site["fragments"], {"A": 0, "C": 2, "G": 8, "T": 0})
+        self.assertEqual(site["coverage"], 10)
+        self.assertEqual(site["line_numbers"], [3])
+        self.assertEqual(site["status"], "match")
+
+    def test_api_evidence_failure_422(self):
+        resp = client.post(
+            "/api/evidence",
+            files={
+                "fasta": ("ref.fa", FASTA, "text/plain"),
+                "vcf": ("c.vcf", vcf(["chrT\t4\t.\tT\tTA\t.\t.\t.\tGT\t0/1"]), "text/plain"),
+                "sam": ("r.sam", evidence_sam([]), "text/plain"),
             },
         )
         self.assertEqual(resp.status_code, 422)

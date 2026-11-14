@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+{% block title %}证据核查结果 · 双 VCF 变异核对{% endblock %}
+{% block body %}
+{% macro pct(site, base) %}
+{%- if site.coverage -%}
+{{ "%.1f"|format(site.fractions[base] * 100) }}%
+{%- else -%}—{%- endif -%}
+{% endmacro %}
+
+{% macro status_badge(site) %}
+{% if site.status == "match" %}
+<span class="tag b-ok" style="background:var(--ok-soft);color:var(--ok)">相符</span>
+{% elif site.status == "insufficient" %}
+<span class="tag b-warn" style="background:var(--warn-soft);color:var(--warn)">证据不足</span>
+{% else %}
+<span class="tag b-bad" style="background:var(--bad-soft);color:var(--bad)">不符</span>
+{% endif %}
+{% endmacro %}
+
+<div class="card">
+  <h2>证据核查概览</h2>
+  <div class="meta">
+    <span class="pill">参考：{{ report.ref_name }}（{{ report.ref_length }} bp）</span>
+    <span class="pill">样本：{{ report.sample_name }}</span>
+    <span class="pill">片段（QNAME）数：{{ report.fragments_total }}</span>
+    <span class="pill">采纳读段：{{ report.reads_used }}</span>
+    <span class="pill">忽略读段：{{ report.reads_ignored }}</span>
+  </div>
+  <div class="summary">
+    <div class="stat">
+      <div class="num" style="color:var(--ok)">{{ report.sites | selectattr("status","equalto","match") | list | length }}</div>
+      <div class="lbl">GT 与读段证据相符</div>
+    </div>
+    <div class="stat">
+      <div class="num" style="color:var(--warn)">{{ report.sites | selectattr("status","equalto","insufficient") | list | length }}</div>
+      <div class="lbl">证据不足（有效覆盖 &lt; 10）</div>
+    </div>
+    <div class="stat">
+      <div class="num" style="color:var(--bad)">{{ report.sites | selectattr("status","equalto","mismatch") | list | length }}</div>
+      <div class="lbl">GT 与证据不符</div>
+    </div>
+  </div>
+  <p><a class="back" href="/evidence">← 返回重新上传</a>　<a class="back" href="/">双 VCF 核对入口</a></p>
+</div>
+
+<div class="card">
+  <h2>位点证据明细<span class="section-badge b-ok">{{ report.sites|length }}</span></h2>
+  {% if report.sites %}
+  <table>
+    <thead>
+      <tr>
+        <th style="width:110px">位点（REF）</th>
+        <th style="width:130px">GT 碱基 / ALT 剂量</th>
+        <th style="width:90px">有效覆盖</th>
+        <th style="width:70px">A（片段）</th>
+        <th style="width:70px">C（片段）</th>
+        <th style="width:70px">G（片段）</th>
+        <th style="width:70px">T（片段）</th>
+        <th style="width:80px">冲突数</th>
+        <th style="width:110px">缺失片段</th>
+        <th style="width:110px">VCF 原始行号</th>
+        <th style="width:110px">判定</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for s in report.sites %}
+      <tr>
+        <td class="mono">{{ s.pos }}:{{ s.ref_base }}</td>
+        <td class="mono">
+          {% for b in s.gt_bases %}<strong style="color:var(--accent)">{{ b }}</strong>{% if not loop.last %}/{% endif %}{% endfor %}
+          {% if s.alt_bases %}<div class="raw">ALT 剂量：{% for b in s.alt_bases %}{{ b }}={{ s.alt_dosage[b] }}{% if not loop.last %}，{% endif %}{% endfor %}</div>{% endif %}
+        </td>
+        <td><strong>{{ s.coverage }}</strong></td>
+        {% for b in ["A","C","G","T"] %}
+        <td class="mono {% if b in s.gt_bases %}gt-base{% endif %}">
+          {{ s.counts[b] }}<div class="raw">{{ pct(s, b) }}</div>
+        </td>
+        {% endfor %}
+        <td>{{ s.conflicts }}</td>
+        <td>{{ s.deletion_fragments }}</td>
+        <td class="mono">{{ s.line_numbers|join(", ") }}<div class="raw">{{ s.raw_descriptions|join("；") }}</div></td>
+        <td>
+          {{ status_badge(s) }}
+          {% if s.mismatch_reasons %}<div class="raw">{% for r in s.mismatch_reasons %}{{ r }}<br>{% endfor %}</div>{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <p class="raw" style="margin-top:10px">
+    占比分母为该位点有效覆盖（A/C/G/T 片段数之和）；冲突片段与落在缺失上的片段不计入覆盖。
+    判定规则：覆盖 &lt; 10 为证据不足；否则 GT 含有的每种碱基占比 ≥ 20%，其余碱基占比 &lt; 20% 才判相符。
+  </p>
+  {% else %}
+  <div class="empty">VCF 中没有被调用（GT 剂量非 0）的单碱基替换位点，无需核查。</div>
+  {% endif %}
+</div>
+{% endblock %}

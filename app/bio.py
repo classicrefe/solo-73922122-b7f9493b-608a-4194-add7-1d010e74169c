@@ -64,6 +64,22 @@ class Call:
     raw_descriptions: list[str] = field(default_factory=list)
 
 
+@dataclass
+class SiteCall:
+    """证据核查用：同一 1-based 位点上所有单碱基替换记录的聚合。"""
+
+    pos: int
+    ref_base: str
+    gt_bases: list[str]                       # GT 含有的去重碱基（REF/ALT，按出现顺序）
+    alt_dosage: dict[str, int] = field(default_factory=dict)  # ALT 碱基 -> 剂量
+    line_numbers: list[int] = field(default_factory=list)
+    raw_descriptions: list[str] = field(default_factory=list)
+
+    @property
+    def label(self) -> str:
+        return f"{self.pos}:{self.ref_base}>" + ",".join(self.alt_dosage)
+
+
 # --------------------------------------------------------------------------- #
 # FASTA
 # --------------------------------------------------------------------------- #
@@ -278,8 +294,13 @@ def _parse_record(
     return per_record
 
 
-def parse_vcf(data: bytes, filename: str, refobj: Reference) -> dict[Variant, Call]:
-    """解析单样本 VCF，返回 {归一变异: Call}。任何硬性错误都抛出 CheckError。"""
+def _vcf_header_and_records(
+    data: bytes, filename: str
+) -> tuple[str, list[tuple[int, list[str]]]]:
+    """解码单样本 VCF 并返回 (样本名, [(物理行号, 字段列表), ...])。
+
+    表头列数、UTF-8 等结构性规则在此统一校验，数据行的字段语义由调用方处理。
+    """
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -307,12 +328,21 @@ def parse_vcf(data: bytes, filename: str, refobj: Reference) -> dict[Variant, Ca
         )
     sample_name = header_fields[9]
 
-    calls: dict[Variant, Call] = {}
+    records: list[tuple[int, list[str]]] = []
     for offset, raw in enumerate(lines[header_idx + 1:], start=header_idx + 2):
         line = raw.rstrip("\r")
         if not line or line.startswith("#"):
             continue
-        fields = line.split("\t")
+        records.append((offset, line.split("\t")))
+    return sample_name, records
+
+
+def parse_vcf(data: bytes, filename: str, refobj: Reference) -> dict[Variant, Call]:
+    """解析单样本 VCF，返回 {归一变异: Call}。任何硬性错误都抛出 CheckError。"""
+    _sample_name, records = _vcf_header_and_records(data, filename)
+
+    calls: dict[Variant, Call] = {}
+    for offset, fields in records:
         record_calls = _parse_record(fields, offset, refobj)
         raw_desc = f"{fields[1]}:{fields[3]}>{fields[4]}"
         for variant, dose in record_calls.items():
@@ -337,7 +367,105 @@ def parse_vcf(data: bytes, filename: str, refobj: Reference) -> dict[Variant, Ca
                 existing.line_numbers.append(offset)
                 existing.raw_descriptions.append(raw_desc)
 
-    return calls, sample_name
+    return calls, _sample_name
+
+
+def parse_snv_sites(
+    data: bytes, filename: str, refobj: Reference
+) -> dict[int, SiteCall]:
+    """证据核查专用：只解析被调用（GT 剂量非 0）的单碱基替换位点。
+
+    沿用 parse_vcf 的全部结构、REF 与 GT 校验；任何被调用的插入 / 缺失（以及
+    其他非 SNV 形态）都令整次核查失败。返回 {1-based 位点: SiteCall}。
+    """
+    _sample_name, records = _vcf_header_and_records(data, filename)
+    sites: dict[int, SiteCall] = {}
+
+    for line_no, fields in records:
+        if len(fields) < 8:
+            raise CheckError(f"第 {line_no} 行：列数不足 8 列，不是合法 VCF 记录。")
+
+        chrom, pos_s, _vid, ref, alt_s, _qual, _filt, _info = fields[:8]
+        if chrom != refobj.name:
+            raise CheckError(
+                f"第 {line_no} 行：CHROM={chrom!r} 与参考 FASTA 名称 "
+                f"{refobj.name!r} 不一致。"
+            )
+        try:
+            pos = int(pos_s)
+        except ValueError:
+            raise CheckError(f"第 {line_no} 行：POS={pos_s!r} 不是整数。")
+        if pos < 1 or pos > len(refobj.sequence):
+            raise CheckError(
+                f"第 {line_no} 行：POS={pos} 超出参考范围"
+                f"（参考长度 {len(refobj.sequence)}）。"
+            )
+        if len(ref) != 1 or ref not in _BASES:
+            raise CheckError(
+                f"第 {line_no} 行：证据核查仅接受单碱基替换，REF={ref!r} 不是单个 A/C/G/T 碱基。"
+            )
+        alts = alt_s.split(",")
+        if any(len(a) != 1 or a not in _BASES for a in alts):
+            raise CheckError(
+                f"第 {line_no} 行：证据核查仅接受单碱基替换，ALT={alt_s!r} 中存在"
+                "非单碱基等位（被调用的插入 / 缺失一律报错）。"
+            )
+
+        if refobj.sequence[pos - 1] != ref:
+            raise CheckError(
+                f"第 {line_no} 行：REF={ref} 与参考序列在 pos={pos} 处的 "
+                f"{refobj.sequence[pos - 1]} 不一致，整次核查失败。"
+            )
+
+        if len(fields) == 8:
+            raise CheckError(
+                f"第 {line_no} 行：缺少 FORMAT 与样本列，本工具要求单样本二倍体 GT。"
+            )
+        fmt = fields[8]
+        fmt_keys = fmt.split(":")
+        if not fmt_keys or fmt_keys[0] != "GT":
+            raise CheckError(
+                f"第 {line_no} 行：FORMAT 必须以 GT 开头，实际为 {fmt!r}。"
+            )
+        sample_values = fields[9].split(":")
+        if len(sample_values) > len(fmt_keys):
+            raise CheckError(f"第 {line_no} 行：样本列的子字段多于 FORMAT 定义。")
+        gt = sample_values[0] if sample_values else ""
+        dosages = parse_diploid_gt(gt, line_no, len(alts))
+        if not dosages:  # 0/0：没有被调用的 ALT，不产生核查位点
+            continue
+
+        site = sites.get(pos)
+        if site is not None and site.ref_base != ref:
+            raise CheckError(
+                f"第 {line_no} 行：pos={pos} 处 REF={ref!r} 与第 "
+                f"{site.line_numbers[0]} 行的 REF={site.ref_base!r} 互相矛盾。"
+            )
+        if site is None:
+            site = SiteCall(pos=pos, ref_base=ref, gt_bases=[])
+            sites[pos] = site
+
+        raw_desc = f"{pos}:{ref}>{alt_s}"
+        site.line_numbers.append(line_no)
+        site.raw_descriptions.append(raw_desc)
+
+        gt_indices = [0] * (2 - sum(dosages.values()))  # GT 中的 REF(0) 次数
+        for alt_idx, dose in dosages.items():
+            gt_indices.extend([alt_idx] * dose)
+            alt_base = alts[alt_idx - 1]
+            site.alt_dosage[alt_base] = site.alt_dosage.get(alt_base, 0) + dose
+        for idx in gt_indices:
+            base = ref if idx == 0 else alts[idx - 1]
+            if base not in site.gt_bases:
+                site.gt_bases.append(base)
+
+        if sum(site.alt_dosage.values()) > 2:
+            raise CheckError(
+                f"第 {line_no} 行：pos={pos} 各 ALT 剂量合计 "
+                f"{sum(site.alt_dosage.values())} 超过二倍体上限 2，整次核查失败。"
+            )
+
+    return sites, _sample_name
 
 
 # --------------------------------------------------------------------------- #

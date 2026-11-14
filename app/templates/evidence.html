@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}读段证据核查 · 双 VCF 变异核对{% endblock %}
+{% block body %}
+{% if error %}
+<div class="alert error">
+  证据核查失败：{{ error }}<br>
+  <span style="font-weight:400;font-size:13.5px">输入错误时整次失败，不展示任何局部结论，请修正输入后重新上传。</span>
+</div>
+{% endif %}
+
+<div class="card">
+  <h2>读段证据核查上传</h2>
+  <form action="/evidence" method="post" enctype="multipart/form-data">
+    <label class="field">
+      单条染色体参考 FASTA
+      <span class="hint">（纯 A/C/G/T，不超过 {{ fasta_limit_kib }} KiB）</span>
+      <input type="file" name="fasta" accept=".fa,.fasta,.fna,text/plain" required>
+    </label>
+    <label class="field">
+      待核查单样本 VCF
+      <span class="hint">（不超过 {{ vcf_limit_kib }} KiB；仅分析被调用的单碱基替换，被调用的插缺直接报错）</span>
+      <input type="file" name="vcf" accept=".vcf,text/plain" required>
+    </label>
+    <label class="field">
+      同染色体 SAM
+      <span class="hint">（不超过 {{ sam_limit_kib }} KiB；CIGAR 仅接受 M/I/D/S）</span>
+      <input type="file" name="sam" accept=".sam,text/plain" required>
+    </label>
+    <button type="submit">开始证据核查</button>
+  </form>
+  <p style="margin:14px 0 0"><a class="back" href="/">← 返回双 VCF 核对</a></p>
+</div>
+
+<div class="card rules">
+  <h2 style="color:var(--ink)">核查与判定规则</h2>
+  <ul>
+    <li>沿用双 VCF 核对的文件大小、REF 与 GT 校验；只分析<strong>被调用的单碱基替换</strong>，任何被调用的插入 / 缺失（及其他非 SNV 形态）令整次失败。</li>
+    <li>SAM 的 CIGAR 仅接受 <span class="mono">M/I/D/S</span>；忽略未比对（0x4）、次级（0x100）、补充（0x800）及 PCR 重复（0x400）读段。</li>
+    <li>整段映射质量 MAPQ 低于 20 的读段不采纳；仅采纳碱基质量 Phred 不低于 20 且为 A/C/G/T 的碱基。</li>
+    <li>按 <strong>QNAME</strong> 把两端合为一个片段：同位点两端碱基冲突记为<strong>冲突</strong>而不计覆盖；片段在该位点落在缺失（D）上不计覆盖。</li>
+    <li>按位点列出 A/C/G/T 四种碱基的<strong>片段数</strong>、冲突数及原始 VCF 行号；多个 ALT 共用同一片段分母，位点 ALT 剂量总和不得超过 2。</li>
+    <li>有效覆盖（四碱基片段数之和）少于 <strong>10</strong> 标为证据不足；否则 GT 含有的每种碱基占比须至少 <strong>20%</strong>，其他碱基均严格低于 20%，并显示是否相符。</li>
+  </ul>
+</div>
+{% endblock %}
